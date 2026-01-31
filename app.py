@@ -1,114 +1,114 @@
-from flask import Flask, request, send_file, render_template_string, abort
-import os, uuid, time
+from flask import Flask, request, send_file, render_template_string
 import requests
+from urllib.parse import urlparse
+import io
 
 app = Flask(__name__)
 
-# ==== SETTINGS (boleh ubah) ====
-MAX_MB = 50  # batas ukuran file (biar aman untuk publik)
 ALLOWED_EXT = {"mp4", "jpg", "jpeg", "png", "pdf"}
-DOWNLOAD_DIR = "downloads"
-# ===============================
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+MAX_MB = 50
 
 HTML = """
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8"/>
+  <meta charset="utf-8">
   <title>Simple File Downloader</title>
   <style>
-    body{font-family:Arial;max-width:780px;margin:40px auto;padding:0 16px}
-    input{width:100%;padding:12px;font-size:16px}
-    button{padding:12px 16px;font-size:16px;margin-top:10px}
-    .hint{color:#666;margin-top:10px}
-    .box{border:1px solid #ddd;border-radius:12px;padding:18px}
+    body{font-family:Arial; max-width:720px; margin:40px auto; padding:0 14px;}
+    input{width:100%; padding:12px; font-size:16px;}
+    button{padding:10px 18px; margin-top:10px; font-size:16px;}
+    .box{border:1px solid #ddd; padding:18px; border-radius:10px;}
+    .tip{color:#666; margin-top:10px;}
+    .err{color:#b00020; margin-top:10px;}
   </style>
 </head>
 <body>
   <h2>Simple File Downloader</h2>
   <div class="box">
-    <form method="post" action="/download">
-      <input name="url" placeholder="Paste direct file URL (mp4/jpg/png/pdf)" required>
+    <form method="POST">
+      <input name="url" placeholder="Paste direct file URL atau link TikTok (vt.tiktok.com / tiktok.com)" required>
       <button type="submit">Download</button>
     </form>
-    <div class="hint">
-      Max size: {{max_mb}}MB • Allowed: mp4/jpg/jpeg/png/pdf<br/>
-      Tips: kalau link kamu bukan direct file, biasanya tidak bisa.
+    <div class="tip">
+      Max size: 50MB • Allowed direct: mp4/jpg/jpeg/png/pdf<br>
+      TikTok link akan otomatis dicari link MP4-nya dulu.
     </div>
+    {% if error %}<div class="err"><b>Bad Request</b><br>{{ error }}</div>{% endif %}
   </div>
 </body>
 </html>
 """
 
-def guess_ext(url: str) -> str:
-    base = url.split("?")[0].split("#")[0]
-    name = base.split("/")[-1]
-    if "." in name:
-        ext = name.rsplit(".", 1)[-1].lower()
-        return ext
-    return ""
+def is_tiktok(url: str) -> bool:
+    u = url.lower()
+    return "tiktok.com" in u or "vt.tiktok.com" in u
 
-def cleanup_old_files(seconds: int = 3600):
-    # hapus file lebih dari 1 jam (biar folder gak numpuk)
-    now = time.time()
-    for fn in os.listdir(DOWNLOAD_DIR):
-        path = os.path.join(DOWNLOAD_DIR, fn)
-        try:
-            if os.path.isfile(path) and now - os.path.getmtime(path) > seconds:
-                os.remove(path)
-        except:
-            pass
+def get_ext_from_url(url: str) -> str:
+    path = urlparse(url).path
+    if "." not in path:
+        return ""
+    return path.rsplit(".", 1)[-1].lower()
 
-@app.get("/")
+def tiktok_to_mp4(url: str) -> str:
+    api = "https://tikwm.com/api/"
+    r = requests.get(api, params={"url": url}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    if not data.get("data"):
+        raise ValueError("Gagal ambil data TikTok (mungkin link salah / video private).")
+
+    mp4 = data["data"].get("play") or data["data"].get("wmplay")
+    if not mp4:
+        raise ValueError("Tidak ketemu link mp4 dari TikTok.")
+    return mp4
+
+@app.route("/", methods=["GET", "POST"])
 def home():
-    cleanup_old_files()
-    return render_template_string(HTML, max_mb=MAX_MB)
-
-@app.post("/download")
-def download():
-    cleanup_old_files()
+    if request.method == "GET":
+        return render_template_string(HTML, error=None)
 
     url = request.form.get("url", "").strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
-        abort(400, "URL harus http/https")
+    if not url.startswith("http"):
+        return render_template_string(HTML, error="URL harus diawali http/https.")
 
-    ext = guess_ext(url)
-    if ext not in ALLOWED_EXT:
-        abort(400, f"Extension tidak diizinkan. Allowed: {', '.join(sorted(ALLOWED_EXT))}")
-
-    # cek ukuran via HEAD (kalau server support)
     try:
-        h = requests.head(url, allow_redirects=True, timeout=15)
-        size = h.headers.get("Content-Length")
-        if size and int(size) > MAX_MB * 1024 * 1024:
-            abort(413, f"File terlalu besar. Max {MAX_MB}MB")
-    except:
-        pass  # kalau HEAD gagal, lanjut download tapi tetap dibatasi saat streaming
+        if is_tiktok(url):
+            url = tiktok_to_mp4(url)
 
-    out_name = f"dl_{uuid.uuid4().hex}.{ext}"
-    out_path = os.path.join(DOWNLOAD_DIR, out_name)
+        ext = get_ext_from_url(url)
+        if ext not in ALLOWED_EXT:
+            return render_template_string(
+                HTML,
+                error=f"Extension tidak diizinkan. Allowed: {', '.join(sorted(ALLOWED_EXT))}."
+            )
 
-    max_bytes = MAX_MB * 1024 * 1024
-    downloaded = 0
+        with requests.get(url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
 
-    with requests.get(url, stream=True, allow_redirects=True, timeout=30) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 256):
+            cl = resp.headers.get("Content-Length")
+            if cl and int(cl) > MAX_MB * 1024 * 1024:
+                return render_template_string(HTML, error=f"File terlalu besar. Maks {MAX_MB}MB.")
+
+            buf = io.BytesIO()
+            size = 0
+            for chunk in resp.iter_content(chunk_size=1024 * 64):
                 if not chunk:
                     continue
-                downloaded += len(chunk)
-                if downloaded > max_bytes:
-                    f.close()
-                    try: os.remove(out_path)
-                    except: pass
-                    abort(413, f"File terlalu besar. Max {MAX_MB}MB")
-                f.write(chunk)
+                size += len(chunk)
+                if size > MAX_MB * 1024 * 1024:
+                    return render_template_string(HTML, error=f"File terlalu besar. Maks {MAX_MB}MB.")
+                buf.write(chunk)
 
-    return send_file(out_path, as_attachment=True, download_name=out_name)
+        buf.seek(0)
+        filename = f"download.{ext}"
+        return send_file(buf, as_attachment=True, download_name=filename)
+
+    except requests.exceptions.RequestException:
+        return render_template_string(HTML, error="Gagal fetch link. Coba link lain / koneksi bermasalah.")
+    except Exception as e:
+        return render_template_string(HTML, error=str(e))
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
